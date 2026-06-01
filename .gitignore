@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+distributed_task_platform.db
+*.sqlite3
+htmlcov/
+.coverage
+dist/
+build/
+
+docs/
