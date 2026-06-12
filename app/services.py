@@ -9,10 +9,11 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import Job, JobAttempt, User
-from app.observability import jobs_created_total
+from app.observability import jobs_completed_total, jobs_created_total, jobs_failed_total
 from app.security import hash_password, verify_password
 
 settings = get_settings()
+CLAIMABLE_JOB_STATUSES = {"queued", "retrying", "scheduled"}
 
 
 def now_utc_naive() -> datetime:
@@ -107,3 +108,101 @@ def list_job_attempts(db: Session, job: Job, owner: User | None = None) -> list[
     return db.scalars(query).all()
 
 
+def mark_job_running(db: Session, job: Job, worker_id: str | None = None) -> Job:
+    if job.status not in CLAIMABLE_JOB_STATUSES:
+        raise ValueError(f"Job {job.id} is not claimable from status {job.status}")
+    job.status = "running"
+    job.worker_id = worker_id
+    job.started_at = job.started_at or now_utc_naive()
+    job.attempts += 1
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+def update_job_status(
+    db: Session,
+    job: Job,
+    status: str,
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+    worker_id: str | None = None,
+) -> Job:
+    job.status = status
+    if result is not None:
+        job.result_json = json.dumps(result, separators=(",", ":"), sort_keys=True)
+    if error is not None:
+        job.last_error = error
+    if worker_id is not None:
+        job.worker_id = worker_id
+    if status == "running" and job.started_at is None:
+        job.started_at = now_utc_naive()
+    if status in {"completed", "failed", "dead_letter"}:
+        job.completed_at = now_utc_naive()
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    if status == "completed":
+        jobs_completed_total.inc()
+    elif status in {"failed", "dead_letter"}:
+        jobs_failed_total.inc()
+    return job
+
+
+def log_attempt(db: Session, job: Job, attempt_number: int, status: str, error_message: str | None = None, worker_id: str | None = None) -> JobAttempt:
+    attempt = JobAttempt(
+        job_id=job.id,
+        attempt_number=attempt_number,
+        status=status,
+        error_message=error_message,
+        worker_id=worker_id,
+        finished_at=now_utc_naive(),
+    )
+    db.add(attempt)
+    db.commit()
+    db.refresh(attempt)
+    return attempt
+
+
+def claim_next_job(db: Session, worker_id: str | None = None) -> Job | None:
+    now = now_utc_naive()
+    query = (
+        select(Job)
+        .where(Job.status.in_(["queued", "retrying"]))
+        .where((Job.run_at.is_(None)) | (Job.run_at <= now))
+        .order_by(Job.created_at.asc())
+    )
+    job = db.scalars(query.limit(1)).first()
+    if not job:
+        return None
+    return mark_job_running(db, job, worker_id=worker_id)
+
+
+def due_scheduled_jobs(db: Session) -> list[Job]:
+    now = now_utc_naive()
+    query = (
+        select(Job)
+        .where(Job.status == "scheduled")
+        .where(Job.run_at.is_not(None))
+        .where(Job.run_at <= now)
+        .order_by(Job.run_at.asc())
+    )
+    return db.scalars(query).all()
+
+
+def build_dashboard_stats(db: Session, active_workers: int = 0, queue_length: int = 0) -> dict[str, int]:
+    grouped = dict(db.execute(select(Job.status, func.count(Job.id)).group_by(Job.status)).all())
+    calculated_queue_length = grouped.get("queued", 0) + grouped.get("retrying", 0)
+    return {
+        "total_jobs": sum(grouped.values()),
+        "queued_jobs": grouped.get("queued", 0),
+        "running_jobs": grouped.get("running", 0),
+        "completed_jobs": grouped.get("completed", 0),
+        "failed_jobs": grouped.get("failed", 0),
+        "retrying_jobs": grouped.get("retrying", 0),
+        "dead_letter_jobs": grouped.get("dead_letter", 0),
+        "scheduled_jobs": grouped.get("scheduled", 0),
+        "active_workers": active_workers,
+        "queue_length": queue_length or calculated_queue_length,
+    }
