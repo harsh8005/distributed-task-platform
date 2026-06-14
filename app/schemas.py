@@ -47,6 +47,10 @@ class JobCreate(BaseModel):
     max_attempts: int | None = None
 
 
+class JobRetryRequest(BaseModel):
+    delay_seconds: int | None = None
+
+
 class JobAttemptRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

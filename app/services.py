@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func, select
@@ -9,11 +9,12 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import Job, JobAttempt, User
-from app.observability import jobs_completed_total, jobs_created_total, jobs_failed_total
+from app.observability import jobs_completed_total, jobs_created_total, jobs_failed_total, jobs_retried_total
 from app.security import hash_password, verify_password
 
 settings = get_settings()
 CLAIMABLE_JOB_STATUSES = {"queued", "retrying", "scheduled"}
+RETRYABLE_JOB_STATUSES = {"completed", "failed", "dead_letter"}
 
 
 def now_utc_naive() -> datetime:
@@ -191,6 +192,7 @@ def due_scheduled_jobs(db: Session) -> list[Job]:
     return db.scalars(query).all()
 
 
+<<<<<<< HEAD
 def build_dashboard_stats(db: Session, active_workers: int = 0, queue_length: int = 0) -> dict[str, int]:
     grouped = dict(db.execute(select(Job.status, func.count(Job.id)).group_by(Job.status)).all())
     calculated_queue_length = grouped.get("queued", 0) + grouped.get("retrying", 0)
@@ -206,3 +208,24 @@ def build_dashboard_stats(db: Session, active_workers: int = 0, queue_length: in
         "active_workers": active_workers,
         "queue_length": queue_length or calculated_queue_length,
     }
+=======
+def retry_job(db: Session, job: Job, delay_seconds: int | None = None) -> Job:
+    if job.status not in RETRYABLE_JOB_STATUSES:
+        raise ValueError(f"Job {job.id} cannot be retried from status {job.status}")
+    if delay_seconds is not None and delay_seconds < 0:
+        raise ValueError("delay_seconds must be greater than or equal to 0")
+
+    now = now_utc_naive()
+    job.status = "scheduled" if delay_seconds else "queued"
+    job.run_at = now if not delay_seconds else now + timedelta(seconds=delay_seconds)
+    job.last_error = None
+    job.result_json = None
+    job.started_at = None
+    job.completed_at = None
+    job.worker_id = None
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    jobs_retried_total.inc()
+    return job
+>>>>>>> fa3d0e8 (Add retry handling with configurable limits and per-attempt history)
