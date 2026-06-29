@@ -40,7 +40,3 @@ app.include_router(jobs_router)
 def metrics():
     return metrics_response()
 
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
