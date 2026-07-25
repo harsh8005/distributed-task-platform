@@ -192,7 +192,6 @@ def due_scheduled_jobs(db: Session) -> list[Job]:
     return db.scalars(query).all()
 
 
-<<<<<<< HEAD
 def build_dashboard_stats(db: Session, active_workers: int = 0, queue_length: int = 0) -> dict[str, int]:
     grouped = dict(db.execute(select(Job.status, func.count(Job.id)).group_by(Job.status)).all())
     calculated_queue_length = grouped.get("queued", 0) + grouped.get("retrying", 0)
@@ -208,7 +207,6 @@ def build_dashboard_stats(db: Session, active_workers: int = 0, queue_length: in
         "active_workers": active_workers,
         "queue_length": queue_length or calculated_queue_length,
     }
-=======
 def retry_job(db: Session, job: Job, delay_seconds: int | None = None) -> Job:
     if job.status not in RETRYABLE_JOB_STATUSES:
         raise ValueError(f"Job {job.id} cannot be retried from status {job.status}")
@@ -228,4 +226,3 @@ def retry_job(db: Session, job: Job, delay_seconds: int | None = None) -> Job:
     db.refresh(job)
     jobs_retried_total.inc()
     return job
->>>>>>> fa3d0e8 (Add retry handling with configurable limits and per-attempt history)
