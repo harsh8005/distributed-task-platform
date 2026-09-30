@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
+import uuid
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -63,7 +64,16 @@ def create_job(
     run_at: datetime | None = None,
     queue_name: str | None = None,
     max_attempts: int | None = None,
+    idempotency_key: str | None = None,
+    correlation_id: str | None = None,
 ) -> Job:
+    if idempotency_key:
+        existing = db.scalar(
+            select(Job).where(Job.owner_id == owner.id, Job.idempotency_key == idempotency_key)
+        )
+        if existing:
+            return existing
+
     normalized_run_at = normalize_datetime(run_at)
     job = Job(
         owner_id=owner.id,
@@ -73,6 +83,8 @@ def create_job(
         queue_name=queue_name if queue_name is not None else settings.queue_name,
         max_attempts=max_attempts if max_attempts is not None else settings.max_job_attempts,
         status="scheduled" if normalized_run_at and normalized_run_at > now_utc_naive() else "queued",
+        idempotency_key=idempotency_key,
+        correlation_id=correlation_id or str(uuid.uuid4()),
     )
     db.add(job)
     db.commit()
@@ -151,13 +163,22 @@ def update_job_status(
     return job
 
 
-def log_attempt(db: Session, job: Job, attempt_number: int, status: str, error_message: str | None = None, worker_id: str | None = None) -> JobAttempt:
+def log_attempt(
+    db: Session,
+    job: Job,
+    attempt_number: int,
+    status: str,
+    error_message: str | None = None,
+    worker_id: str | None = None,
+    correlation_id: str | None = None,
+) -> JobAttempt:
     attempt = JobAttempt(
         job_id=job.id,
         attempt_number=attempt_number,
         status=status,
         error_message=error_message,
         worker_id=worker_id,
+        correlation_id=correlation_id,
         finished_at=now_utc_naive(),
     )
     db.add(attempt)
@@ -174,17 +195,43 @@ def claim_next_job(db: Session, worker_id: str | None = None) -> Job | None:
         .where((Job.run_at.is_(None)) | (Job.run_at <= now))
         .order_by(Job.created_at.asc())
     )
-    job = db.scalars(query.limit(1)).first()
-    if not job:
-        return None
-    return mark_job_running(db, job, worker_id=worker_id)
+    if db.bind and db.bind.dialect.name == "postgresql":
+        query = query.with_for_update(skip_locked=True)
+        job = db.scalars(query.limit(1)).first()
+        if not job:
+            return None
+        return mark_job_running(db, job, worker_id=worker_id)
+    else:
+        while True:
+            job = db.scalars(query.limit(1)).first()
+            if not job:
+                return None
+            
+            from sqlalchemy import update
+            stmt = (
+                update(Job)
+                .where(Job.id == job.id)
+                .where(Job.status == job.status)
+                .values(
+                    status="running",
+                    worker_id=worker_id,
+                    started_at=job.started_at or now_utc_naive(),
+                    attempts=Job.attempts + 1
+                )
+            )
+            result = db.execute(stmt)
+            if result.rowcount > 0:
+                db.commit()
+                db.refresh(job)
+                return job
+            # If rowcount == 0, another worker already claimed it, loop again
 
 
 def due_scheduled_jobs(db: Session) -> list[Job]:
     now = now_utc_naive()
     query = (
         select(Job)
-        .where(Job.status == "scheduled")
+        .where(Job.status.in_(["scheduled", "retrying"]))
         .where(Job.run_at.is_not(None))
         .where(Job.run_at <= now)
         .order_by(Job.run_at.asc())
@@ -207,6 +254,7 @@ def build_dashboard_stats(db: Session, active_workers: int = 0, queue_length: in
         "active_workers": active_workers,
         "queue_length": queue_length or calculated_queue_length,
     }
+
 def retry_job(db: Session, job: Job, delay_seconds: int | None = None) -> Job:
     if job.status not in RETRYABLE_JOB_STATUSES:
         raise ValueError(f"Job {job.id} cannot be retried from status {job.status}")
@@ -226,3 +274,35 @@ def retry_job(db: Session, job: Job, delay_seconds: int | None = None) -> Job:
     db.refresh(job)
     jobs_retried_total.inc()
     return job
+
+
+def recover_orphaned_jobs(db: Session, timeout_minutes: int = 30) -> int:
+    now = now_utc_naive()
+    cutoff = now - timedelta(minutes=timeout_minutes)
+    
+    query = (
+        select(Job)
+        .where(Job.status == "running")
+        .where(Job.started_at <= cutoff)
+    )
+    orphans = db.scalars(query).all()
+    count = 0
+    for job in orphans:
+        error_msg = f"Orphaned job recovered after {timeout_minutes} minutes"
+        log_attempt(db, job, job.attempts, "failed", error_message=error_msg, worker_id=job.worker_id, correlation_id=job.correlation_id)
+        if job.attempts < job.max_attempts:
+            job.status = "retrying"
+            job.last_error = error_msg
+            job.run_at = now + timedelta(seconds=settings.retry_delay_seconds)
+        else:
+            job.status = "dead_letter"
+            job.last_error = error_msg
+            job.completed_at = now
+            jobs_failed_total.inc()
+        
+        db.add(job)
+        db.commit()
+        count += 1
+        
+    return count
+

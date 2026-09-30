@@ -112,3 +112,60 @@ def test_retry_and_schedule_flow_clears_previous_result(db_session):
 
     attempts = list_job_attempts(db_session, retried, owner=user)
     assert len(attempts) == 1
+
+
+def test_job_idempotency_returns_existing_job(db_session):
+    user = create_test_user(db_session)
+    job1 = job_routes.create_new_job(
+        JobCreate(job_type="math", payload={"action": "sum", "numbers": [1, 2]}, idempotency_key="key-abc-123"),
+        db=db_session,
+        current_user=user,
+    )
+    job2 = job_routes.create_new_job(
+        JobCreate(job_type="math", payload={"action": "sum", "numbers": [1, 2]}, idempotency_key="key-abc-123"),
+        db=db_session,
+        current_user=user,
+    )
+    assert job1.id == job2.id
+    assert job1.idempotency_key == "key-abc-123"
+
+
+def test_correlation_id_propagation(db_session):
+    user = create_test_user(db_session)
+    job = job_routes.create_new_job(
+        JobCreate(job_type="math", payload={"action": "sum", "numbers": [1, 2]}, correlation_id="trace-xyz-789"),
+        db=db_session,
+        current_user=user,
+    )
+    assert job.correlation_id == "trace-xyz-789"
+
+    claimed = claim_next_job(db_session, worker_id="worker-test")
+    assert claimed is not None
+    process_claimed_job(db_session, claimed)
+
+    attempts = job_routes.get_job_attempts(job.id, db=db_session, current_user=user)
+    assert attempts.total == 1
+    assert attempts.items[0].correlation_id == "trace-xyz-789"
+
+
+def test_orphaned_jobs_recovery(db_session):
+    from datetime import timedelta
+    from app.services import now_utc_naive, recover_orphaned_jobs
+
+    user = create_test_user(db_session)
+    job = create_job(db_session, owner=user, payload={"action": "echo"}, max_attempts=2)
+    claimed = claim_next_job(db_session, worker_id="crashed-worker")
+    assert claimed is not None
+
+    # Simulate worker crash by winding back started_at past the cutoff
+    claimed.started_at = now_utc_naive() - timedelta(minutes=45)
+    db_session.add(claimed)
+    db_session.commit()
+
+    recovered_count = recover_orphaned_jobs(db_session, timeout_minutes=30)
+    assert recovered_count == 1
+
+    db_session.refresh(claimed)
+    assert claimed.status == "retrying"
+    assert "Orphaned job recovered" in claimed.last_error
+

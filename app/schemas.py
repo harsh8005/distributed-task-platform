@@ -45,6 +45,8 @@ class JobCreate(BaseModel):
     run_at: datetime | None = None
     queue_name: str | None = None
     max_attempts: int | None = None
+    idempotency_key: str | None = None
+    correlation_id: str | None = None
 
 
 class JobRetryRequest(BaseModel):
@@ -58,10 +60,11 @@ class JobAttemptRead(BaseModel):
     job_id: str
     attempt_number: int
     status: str
-    error_message: str | None
-    worker_id: str | None
+    error_message: str | None = None
+    worker_id: str | None = None
+    correlation_id: str | None = None
     started_at: datetime
-    finished_at: datetime | None
+    finished_at: datetime | None = None
 
 
 class JobRead(BaseModel):
@@ -76,13 +79,15 @@ class JobRead(BaseModel):
     result: dict[str, Any] | None = None
     attempts: int
     max_attempts: int
-    run_at: datetime | None
+    run_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
-    started_at: datetime | None
-    completed_at: datetime | None
-    last_error: str | None
-    worker_id: str | None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    last_error: str | None = None
+    worker_id: str | None = None
+    idempotency_key: str | None = None
+    correlation_id: str | None = None
 
 
 class JobListResponse(BaseModel):
@@ -106,3 +111,10 @@ class DashboardStats(BaseModel):
     scheduled_jobs: int
     active_workers: int
     queue_length: int
+
+
+class HealthResponse(BaseModel):
+    status: str
+    service: str
+    environment: str
+

@@ -38,6 +38,8 @@ def to_job_read(job: Job) -> JobRead:
         completed_at=job.completed_at,
         last_error=job.last_error,
         worker_id=job.worker_id,
+        idempotency_key=job.idempotency_key,
+        correlation_id=job.correlation_id,
     )
 
 
@@ -49,6 +51,7 @@ def to_job_attempt_read(attempt) -> JobAttemptRead:
         status=attempt.status,
         error_message=attempt.error_message,
         worker_id=attempt.worker_id,
+        correlation_id=attempt.correlation_id,
         started_at=attempt.started_at,
         finished_at=attempt.finished_at,
     )
@@ -68,9 +71,11 @@ def create_new_job(
         run_at=payload.run_at,
         queue_name=payload.queue_name,
         max_attempts=payload.max_attempts,
+        idempotency_key=payload.idempotency_key,
+        correlation_id=payload.correlation_id,
     )
     if job.status == "queued":
-        broker.publish(QueueMessage(job_id=job.id), queue_name=job.queue_name)
+        broker.publish(QueueMessage(job_id=job.id, correlation_id=job.correlation_id), queue_name=job.queue_name)
     cache.delete("dashboard:stats")
     return to_job_read(job)
 

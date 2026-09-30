@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Callable
 
 from app.config import get_settings
@@ -13,6 +13,7 @@ settings = get_settings()
 class QueueMessage:
     job_id: str
     event: str = "process"
+    correlation_id: str | None = None
 
 
 class BrokerClient:
@@ -48,7 +49,7 @@ class BrokerClient:
             channel.basic_publish(
                 exchange="",
                 routing_key=queue,
-                body=json.dumps(message.__dict__).encode("utf-8"),
+                body=json.dumps(asdict(message)).encode("utf-8"),
                 properties=pika.BasicProperties(delivery_mode=2),
             )
             return True

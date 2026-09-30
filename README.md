@@ -80,17 +80,18 @@ development.
 
 ## Features
 
-- User registration and login
-- JWT access and refresh tokens
-- Authenticated job creation and retrieval
-- Job filtering and pagination
-- Scheduled jobs via `run_at`
-- Retry support with configurable delay
-- Dead-letter handling after max attempts
-- Job attempt history endpoint
-- Dashboard stats endpoint
-- Health and readiness checks
-- Prometheus metrics endpoint
+- **User Authentication**: JWT access and refresh tokens with bcrypt password hashing
+- **Job Orchestration**: Authenticated job creation, filtering, status tracking, and pagination
+- **Idempotent Job Creation**: Client-provided `idempotency_key` guarantees safe network retries without duplicate executions
+- **Distributed Concurrency Control**: PostgreSQL `SELECT ... FOR UPDATE SKIP LOCKED` (and atomic CAS update fallback) prevents double-claiming race conditions across workers
+- **Self-Healing Orphan Recovery**: Periodic scan automatically recovers tasks abandoned by crashed worker pods/processes
+- **End-to-End Distributed Tracing**: Unique `correlation_id` propagated across API $\rightarrow$ Database $\rightarrow$ RabbitMQ $\rightarrow$ Worker attempt logs
+- **Graceful Worker Shutdown**: Signal trapping (`SIGTERM`, `SIGINT`) allows active jobs to finish cleanly before process termination
+- **Delayed & Scheduled Execution**: Timestamp-based deferred task execution (`run_at`) managed by a dedicated scheduler service
+- **Fault Tolerance**: Automatic retries with exponential backoff delay and Dead-Letter Queue (DLQ) state machine
+- **Audit Logging**: Per-attempt execution log capturing worker ID, timestamps, status, and error traces
+- **Observability**: Prometheus metrics, health & readiness endpoints, and Grafana monitoring dashboards
+- **Hybrid Architecture**: SQLite for local lightweight development, PostgreSQL + Redis + RabbitMQ for production Docker deployment
 
 ## Tech Stack
 
@@ -298,6 +299,20 @@ Authorization: Bearer <access_token>
 }
 ```
 
+### Idempotent job with correlation tracking
+
+```json
+{
+  "job_type": "math",
+  "idempotency_key": "payment-tx-94812",
+  "correlation_id": "req-trace-41829a",
+  "payload": {
+    "action": "sum",
+    "numbers": [100, 250, 75]
+  }
+}
+```
+
 ## Job States
 
 - `queued`
@@ -315,13 +330,16 @@ Run the test suite:
 python -m pytest
 ```
 
-The current tests cover:
+The test suite covers:
 
-- authentication registration and login
-- job creation and processing
-- retry rejection rules
-- scheduled retry behavior
-- job attempt history
+- Authentication registration and login round-trip
+- Full job lifecycle (queued $\rightarrow$ running $\rightarrow$ dead_letter / completed)
+- Per-attempt execution history auditing
+- Active job retry prevention (409 Conflict)
+- Retry and delayed schedule flows
+- **Idempotency key deduplication** (duplicate submissions safely return existing job)
+- **Correlation ID distributed tracing propagation**
+- **Self-healing orphaned job recovery** under worker crashes
 
 ## Observability
 
