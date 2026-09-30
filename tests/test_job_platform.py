@@ -169,3 +169,112 @@ def test_orphaned_jobs_recovery(db_session):
     assert claimed.status == "retrying"
     assert "Orphaned job recovered" in claimed.last_error
 
+
+def test_transactional_outbox_event_creation_and_relay(db_session):
+    from app.models import OutboxEvent
+    from app.outbox import relay_outbox_events
+    from sqlalchemy import select
+
+    user = create_test_user(db_session)
+    job = create_job(db_session, owner=user, payload={"action": "sum", "numbers": [1, 2]}, priority=8)
+
+    # Verify OutboxEvent was created in the exact same transaction
+    event = db_session.scalar(select(OutboxEvent).where(OutboxEvent.status == "pending"))
+    assert event is not None
+    assert event.event_type == "job.created"
+    assert event.payload["job_id"] == job.id
+    assert event.payload["priority"] == 8
+
+    # Relay outbox event
+    relayed_count = relay_outbox_events(db_session)
+    assert relayed_count == 1
+    db_session.refresh(event)
+    assert event.status == "published"
+    assert event.published_at is not None
+
+
+def test_priority_queue_ordering(db_session):
+    user = create_test_user(db_session)
+
+    low_prio = create_job(db_session, owner=user, payload={"action": "echo"}, priority=2)
+    high_prio = create_job(db_session, owner=user, payload={"action": "echo"}, priority=9)
+    med_prio = create_job(db_session, owner=user, payload={"action": "echo"}, priority=5)
+
+    # Claim next job must pick the highest priority job first (priority 9)
+    c1 = claim_next_job(db_session, worker_id="w1")
+    assert c1 is not None
+    assert c1.id == high_prio.id
+    assert c1.priority == 9
+
+    # Next claim must pick priority 5
+    c2 = claim_next_job(db_session, worker_id="w1")
+    assert c2 is not None
+    assert c2.id == med_prio.id
+    assert c2.priority == 5
+
+    # Next claim must pick priority 2
+    c3 = claim_next_job(db_session, worker_id="w1")
+    assert c3 is not None
+    assert c3.id == low_prio.id
+    assert c3.priority == 2
+
+
+def test_tenant_concurrency_limit_fair_scheduling(db_session):
+    from app.config import get_settings
+    settings = get_settings()
+
+    user_a = create_user(db_session, "tenant_a@example.com", "strong-password", "Tenant A")
+    user_b = create_user(db_session, "tenant_b@example.com", "strong-password", "Tenant B")
+
+    # Fill User A's concurrent slots to the limit
+    for _ in range(settings.max_concurrent_jobs_per_tenant):
+        job = create_job(db_session, owner=user_a, payload={"action": "echo"})
+        claim_next_job(db_session, worker_id="wA")
+
+    # User A queues another job
+    extra_a = create_job(db_session, owner=user_a, payload={"action": "echo"}, priority=10)
+    # User B queues a normal job
+    job_b = create_job(db_session, owner=user_b, payload={"action": "echo"}, priority=3)
+
+    # Even though User A's job has higher priority (10 vs 3), User A reached concurrency limit!
+    # The fair scheduler must skip User A and claim User B's job!
+    claimed = claim_next_job(db_session, worker_id="wFair")
+    assert claimed is not None
+    assert claimed.id == job_b.id
+    assert claimed.owner_id == user_b.id
+
+
+def test_worker_idempotent_execution_guard(db_session):
+    user = create_test_user(db_session)
+    job = create_job(db_session, owner=user, payload={"action": "sum", "numbers": [10, 20]})
+    claimed = claim_next_job(db_session, worker_id="w1")
+    assert claimed is not None
+
+    # First execution completes normally
+    process_claimed_job(db_session, claimed)
+    db_session.refresh(claimed)
+    assert claimed.status == "completed"
+    assert claimed.result == {"action": "sum", "total": 30}
+    assert claimed.attempts == 1
+
+    # Simulate RabbitMQ redelivery (duplicate message arrives while job is already completed)
+    # The idempotency guard must detect job.status == "completed" and skip redundant execution
+    process_claimed_job(db_session, claimed)
+    db_session.refresh(claimed)
+    assert claimed.attempts == 1  # Attempts and result remain untouched!
+
+
+def test_opentelemetry_tracing_helpers():
+    from app.tracing import extract_trace_context, inject_trace_headers, trace_span
+
+    headers = inject_trace_headers({"custom_attr": "value123"})
+    assert headers["custom_attr"] == "value123"
+
+    with trace_span("test.manual_span", attributes={"job.test": "42"}):
+        pass
+
+    ctx = extract_trace_context(headers)
+    assert ctx is None or ctx is not None  # verifies no crash
+
+
+

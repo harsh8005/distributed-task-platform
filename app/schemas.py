@@ -47,6 +47,7 @@ class JobCreate(BaseModel):
     max_attempts: int | None = None
     idempotency_key: str | None = None
     correlation_id: str | None = None
+    priority: int = Field(default=5, ge=1, le=10)
 
 
 class JobRetryRequest(BaseModel):
@@ -88,6 +89,7 @@ class JobRead(BaseModel):
     worker_id: str | None = None
     idempotency_key: str | None = None
     correlation_id: str | None = None
+    priority: int = 5
 
 
 class JobListResponse(BaseModel):

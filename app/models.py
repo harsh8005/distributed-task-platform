@@ -51,6 +51,8 @@ class Job(Base):
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     correlation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, default=5, index=True, nullable=False)
+    execution_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     owner: Mapped["User"] = relationship(back_populates="jobs")
     attempts_log: Mapped[list["JobAttempt"]] = relationship(back_populates="job", cascade="all, delete-orphan")
@@ -84,4 +86,23 @@ class JobAttempt(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
 
     job: Mapped["Job"] = relationship(back_populates="attempts_log")
+
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    event_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True, nullable=False)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=utcnow, index=True, nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        import json
+
+        return json.loads(self.payload_json)
 

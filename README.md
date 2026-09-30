@@ -44,29 +44,34 @@ High-level flow:
 
 ```mermaid
 flowchart LR
-    Client[Client / API Consumer]
-    API["FastAPI API<br/>Auth and Job Management"]
-    DB[("PostgreSQL<br/>Users, Jobs, Attempts")]
-    SQLite[("SQLite<br/>Local Development")]
-    RabbitMQ{"RabbitMQ<br/>Optional Message Broker"}
-    Worker["Background Worker<br/>Claim and Process Jobs"]
-    Scheduler["Scheduler<br/>Release Due Jobs"]
-    Redis[("Redis<br/>Dashboard Stats Cache")]
+    Client[Client / Locust Load Test]
+    API["FastAPI API<br/>Auth & Outbox Writer"]
+    DB[("PostgreSQL / SQLite<br/>Jobs, Outbox, Attempts")]
+    OutboxRelay["Outbox Relay<br/>SKIP LOCKED Dispatcher"]
+    RabbitMQ{"RabbitMQ Priority Queue<br/>x-max-priority: 10"}
+    Worker["Background Worker<br/>Idempotent Exec & Fair Limiter"]
+    Scheduler["Scheduler<br/>Release Due Jobs & Outbox Sweep"]
+    Autoscaler["Autoscaler<br/>Lag-driven Pool Scaling"]
+    Redis[("Redis<br/>Stats Cache & Tokens")]
+    Jaeger["Jaeger<br/>Distributed Traces"]
     Prometheus["Prometheus<br/>Metrics Collection"]
-    Grafana["Grafana<br/>Monitoring Dashboards"]
+    Grafana["Grafana<br/>Dashboards"]
 
-    Client -->|JWT-authenticated REST| API
-    API -->|Read and write| DB
-    API -.->|Local mode| SQLite
-    API -->|Publish ready jobs| RabbitMQ
-    RabbitMQ -->|Consume jobs| Worker
-    Worker -->|Fallback polling| DB
-    Worker -->|Update status and attempts| DB
-    Scheduler -->|Find due scheduled jobs| DB
-    Scheduler -->|Queue released jobs| RabbitMQ
-    API -->|Cache dashboard stats| Redis
-    Redis -->|Serve cached stats| API
+    Client -->|HTTP + traceparent| API
+    API -->|Atomic Transaction: Job + Outbox| DB
+    OutboxRelay -->|Read Pending Outbox| DB
+    OutboxRelay -->|Reliable AMQP Publish| RabbitMQ
+    RabbitMQ -->|Consume by Priority| Worker
+    Worker -->|Fallback Polling & Fair Claims| DB
+    Worker -->|Update Status & Attempts| DB
+    Scheduler -->|Find Due Scheduled Jobs| DB
+    Scheduler -->|Trigger Outbox Relay| OutboxRelay
+    Autoscaler -->|Query Backlog Lag| DB
+    API -->|Cache Dashboard Stats| Redis
+    API -->|OTel Traces| Jaeger
+    Worker -->|OTel Traces| Jaeger
     API -->|Expose /metrics| Prometheus
+    Autoscaler -->|Expose Metrics| Prometheus
     Prometheus --> Grafana
 ```
 
@@ -80,46 +85,58 @@ development.
 
 ## Features
 
-- **User Authentication**: JWT access and refresh tokens with bcrypt password hashing
-- **Job Orchestration**: Authenticated job creation, filtering, status tracking, and pagination
-- **Idempotent Job Creation**: Client-provided `idempotency_key` guarantees safe network retries without duplicate executions
-- **Distributed Concurrency Control**: PostgreSQL `SELECT ... FOR UPDATE SKIP LOCKED` (and atomic CAS update fallback) prevents double-claiming race conditions across workers
-- **Self-Healing Orphan Recovery**: Periodic scan automatically recovers tasks abandoned by crashed worker pods/processes
-- **End-to-End Distributed Tracing**: Unique `correlation_id` propagated across API $\rightarrow$ Database $\rightarrow$ RabbitMQ $\rightarrow$ Worker attempt logs
-- **Graceful Worker Shutdown**: Signal trapping (`SIGTERM`, `SIGINT`) allows active jobs to finish cleanly before process termination
-- **Delayed & Scheduled Execution**: Timestamp-based deferred task execution (`run_at`) managed by a dedicated scheduler service
-- **Fault Tolerance**: Automatic retries with exponential backoff delay and Dead-Letter Queue (DLQ) state machine
-- **Audit Logging**: Per-attempt execution log capturing worker ID, timestamps, status, and error traces
-- **Observability**: Prometheus metrics, health & readiness endpoints, and Grafana monitoring dashboards
-- **Hybrid Architecture**: SQLite for local lightweight development, PostgreSQL + Redis + RabbitMQ for production Docker deployment
+- **Transactional Outbox Pattern**: Eliminates dual-write anomalies by atomically saving jobs and outbox events in a single database transaction, asynchronously dispatched to RabbitMQ via `SELECT ... FOR UPDATE SKIP LOCKED`.
+- **Priority Queues (1–10)**: Strict prioritization with RabbitMQ `x-max-priority: 10` and database fallback indexing.
+- **Fair Multi-Tenant Concurrency Limits**: Per-tenant concurrency caps (`MAX_CONCURRENT_JOBS_PER_TENANT`) isolate noisy neighbors and prevent queue starvation.
+- **Worker Execution Idempotency**: Guard against duplicate side effects during at-least-once AMQP redeliveries.
+- **Distributed Tracing (OpenTelemetry + Jaeger)**: Cross-service span context propagation across HTTP headers, database queries, and RabbitMQ message headers.
+- **Automated Worker Autoscaler**: Backlog-aware dynamic scaling calculations (`autoscaler.py`).
+- **Locust Load Testing Suite**: Realistic multi-tenant stress tests measuring throughput, p95/p99 latency, and saturation.
+- **Chaos Engineering & Resilience**: Automated failure-injection tests validating recovery from broker outages, crashed worker pods, and poison pills.
+- **Self-Healing Orphan Reclamation**: Background recovery of zombie jobs abandoned by crashed worker pods.
+- **Observability**: Prometheus metrics, health & readiness endpoints, and Grafana monitoring dashboards.
+- **Production Containerization**: Full multi-container Docker Compose topology (API, Workers, Scheduler, Postgres, Redis, RabbitMQ, Jaeger, Prometheus, Grafana).
 
 ## Tech Stack
 
 - Python 3.10+
-- FastAPI
-- SQLAlchemy
-- Pydantic v2
-- PostgreSQL
-- SQLite
-- Redis
-- RabbitMQ
-- Prometheus client
+- FastAPI & Uvicorn
+- SQLAlchemy 2.0 & Alembic
+- PostgreSQL & SQLite
+- RabbitMQ & Redis
+- OpenTelemetry SDK & Jaeger
+- Prometheus & Grafana
+- Locust (Load Testing)
+- Pytest (Unit, Integration & Chaos Tests)
 
 ## Project Structure
 
 ```txt
 app/
-  main.py
-  routers/
-  services.py
-  models.py
-  schemas.py
-  worker.py
-  scheduler.py
-tests/
-alembic/
-monitoring/
-grafana/
+  broker.py       # RabbitMQ publisher & consumer with priority support
+  cache.py        # Redis caching layer
+  config.py       # Pydantic v2 application settings
+  database.py     # SQLAlchemy engine & session factory
+  dependencies.py # Auth & DB dependency injection
+  main.py         # FastAPI application entrypoint with OTel instrumentation
+  models.py       # User, Job, JobAttempt, OutboxEvent models
+  observability.py# Prometheus metrics & exporter
+  outbox.py       # Transactional Outbox engine & SKIP LOCKED relay
+  routers/        # Auth, Jobs, Health REST endpoints
+  schemas.py      # Pydantic v2 request/response contracts
+  security.py     # JWT & password hashing
+  services.py     # Job lifecycle, concurrency control & fair scheduler
+  tracing.py      # OpenTelemetry provider & W3C context propagation
+worker.py         # Background worker with execution idempotency guard
+scheduler.py      # Delayed job release & orphan recovery engine
+autoscaler.py     # Queue lag dynamic worker autoscaler
+load_tests/       # Locust performance & load testing suite
+docs/
+  architecture.md # Deep-dive architectural specification
+  failure_recovery.md # Disaster Recovery & Failure Modes runbook
+monitoring/       # Prometheus scrape configuration
+grafana/          # Provisioned monitoring dashboards
+tests/            # Unit, integration, and chaos test suites
 ```
 
 ## Setup
@@ -211,6 +228,7 @@ Typical services exposed by the compose file:
 - PostgreSQL on `5432`
 - Redis on `6379`
 - RabbitMQ management UI on `15672`
+- Jaeger Tracing UI on `16686` (OTLP on `4317`/`4318`)
 - Prometheus on `9090`
 - Grafana on `3000`
 
@@ -322,24 +340,39 @@ Authorization: Bearer <access_token>
 - `completed`
 - `dead_letter`
 
-## Testing
+## Testing & Chaos Engineering
 
-Run the test suite:
+Run the complete test suite (18 automated tests across unit, integration, and chaos suites):
 
 ```bash
 python -m pytest
 ```
 
-The test suite covers:
+### Test Suite Structure
 
-- Authentication registration and login round-trip
-- Full job lifecycle (queued $\rightarrow$ running $\rightarrow$ dead_letter / completed)
-- Per-attempt execution history auditing
-- Active job retry prevention (409 Conflict)
-- Retry and delayed schedule flows
-- **Idempotency key deduplication** (duplicate submissions safely return existing job)
-- **Correlation ID distributed tracing propagation**
-- **Self-healing orphaned job recovery** under worker crashes
+1. **Unit & API Integration Tests (`tests/test_job_platform.py`)**:
+   - Authentication registration and JWT token round-trip
+   - Job lifecycle state machine (queued $\rightarrow$ running $\rightarrow$ completed / dead_letter)
+   - Per-attempt execution history auditing
+   - Active job retry rejection (409 Conflict)
+   - **Transactional Outbox Event Creation & Relay** (atomic DB persistence + AMQP dispatch)
+   - **Priority Queue Scheduling** (jobs processed strictly in priority 10 $\rightarrow$ 1 order)
+   - **Multi-Tenant Concurrency Fairness** (noisy neighbor isolation when tenant caps are hit)
+   - **Worker Execution Idempotency** (ignoring redelivered tasks already completed)
+   - **OpenTelemetry Tracing Helpers** (trace context injection and span creation)
+
+2. **Chaos Engineering & Failure-Injection Tests (`tests/test_chaos_failure_injection.py`)**:
+   - **Crashed Worker Mid-Task**: Abrupt worker death (`SIGKILL`) $\rightarrow$ self-healing orphan recovery re-enqueues job.
+   - **Broker Outage Buffer**: RabbitMQ outage $\rightarrow$ outbox tables buffer jobs in DB $\rightarrow$ full recovery upon broker restart.
+   - **Poison Pill Payload Isolation**: Malformed task payloads are isolated to DLQ without crashing the worker process.
+   - **Tenant Saturation**: Queue flooding is throttled per tenant so normal tenants receive timely execution.
+   - **Autoscaler Scaling Calculations**: Backlog spikes dynamically compute proportional worker capacity.
+
+3. **Performance & Load Testing (`load_tests/`)**:
+   - See [load_tests/README.md](load_tests/README.md) for running Locust benchmarks.
+
+4. **Failure Recovery Runbooks (`docs/failure_recovery.md`)**:
+   - See [docs/failure_recovery.md](docs/failure_recovery.md) for incident runbooks and architecture failure modes.
 
 ## Observability
 

@@ -65,9 +65,14 @@ def process_payload(payload: dict) -> dict:
 
 
 def process_claimed_job(db: Session, job: Job) -> None:
+    # Idempotent Execution Guard: If the job was already completed, skip re-execution
+    if job.status == "completed":
+        logger.warning("Job %s already marked completed. Skipping redundant execution (idempotency guard).", job.id)
+        return
+
     worker_id = job.worker_id or WORKER_ID
     started = time.perf_counter()
-    logger.info("Processing job %s [correlation_id=%s]", job.id, job.correlation_id)
+    logger.info("Processing job %s [priority=%s, correlation_id=%s, token=%s]", job.id, job.priority, job.correlation_id, job.execution_token)
     try:
         result = process_payload(job.payload)
         update_job_status(db, job, "completed", result=result, worker_id=worker_id)
@@ -97,11 +102,19 @@ def consume_with_rabbitmq() -> None:
             job = get_job(db, message.job_id)
             if not job:
                 return
+            if job.status == "completed":
+                logger.info("Job %s already completed. Acknowledging message without duplicate execution.", job.id)
+                return
             if job.status not in {"queued", "retrying", "scheduled"}:
+                logger.info("Job %s currently in status '%s'; ignoring redelivery.", job.id, job.status)
                 return
             job.correlation_id = message.correlation_id or job.correlation_id
-            mark_job_running(db, job, worker_id=WORKER_ID)
-            process_claimed_job(db, job)
+            
+            from app.tracing import extract_trace_context, trace_span
+            parent_ctx = extract_trace_context(message.headers)
+            with trace_span("worker.process_job", attributes={"job.id": job.id, "job.priority": job.priority}, parent_context=parent_ctx):
+                mark_job_running(db, job, worker_id=WORKER_ID)
+                process_claimed_job(db, job)
 
     try:
         broker.consume(handler)
@@ -125,6 +138,8 @@ def poll_database() -> None:
 
 
 def main() -> None:
+    from app.tracing import setup_telemetry
+    setup_telemetry(service_name="dtp-worker")
     logger.info("Starting worker %s", WORKER_ID)
     if settings.enable_rabbitmq:
         try:

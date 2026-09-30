@@ -33,6 +33,17 @@ class Settings(BaseSettings):
     metrics_namespace: str = "dtp"
     cors_allow_origins: str = "*"
 
+    max_concurrent_jobs_per_tenant: int = 5
+    outbox_poll_interval_seconds: float = 1.0
+    outbox_max_retries: int = 5
+
+    enable_otel: bool = False
+    otlp_endpoint: str = "http://localhost:4318/v1/traces"
+
+    autoscaler_min_workers: int = 1
+    autoscaler_max_workers: int = 10
+    autoscaler_jobs_per_worker: int = 5
+
     @property
     def allow_all_origins(self) -> bool:
         return self.cors_allow_origins.strip() == "*"

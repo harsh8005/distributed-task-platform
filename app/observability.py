@@ -17,8 +17,21 @@ job_processing_seconds = Histogram(
     f"{settings.metrics_namespace}_job_processing_seconds",
     "Job processing duration in seconds",
 )
+outbox_events_relayed_total = Counter(
+    f"{settings.metrics_namespace}_outbox_events_relayed_total",
+    "Outbox events successfully published to message broker",
+)
+outbox_events_failed_total = Counter(
+    f"{settings.metrics_namespace}_outbox_events_failed_total",
+    "Outbox events failed to publish",
+)
+autoscaler_desired_workers = Gauge(
+    f"{settings.metrics_namespace}_autoscaler_desired_workers",
+    "Desired workers calculated by autoscaler",
+)
 
 
 def metrics_response() -> Response:
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 

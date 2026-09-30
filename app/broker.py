@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Callable
 
 from app.config import get_settings
@@ -14,6 +14,9 @@ class QueueMessage:
     job_id: str
     event: str = "process"
     correlation_id: str | None = None
+    priority: int = 5
+    headers: dict[str, str] = field(default_factory=dict)
+
 
 
 class BrokerClient:
@@ -45,12 +48,16 @@ class BrokerClient:
             import pika
 
             channel = connection.channel()
-            channel.queue_declare(queue=queue, durable=True)
+            channel.queue_declare(queue=queue, durable=True, arguments={"x-max-priority": 10})
             channel.basic_publish(
                 exchange="",
                 routing_key=queue,
                 body=json.dumps(asdict(message)).encode("utf-8"),
-                properties=pika.BasicProperties(delivery_mode=2),
+                properties=pika.BasicProperties(
+                    delivery_mode=2,
+                    priority=min(max(message.priority, 1), 10),
+                    headers=message.headers or {},
+                ),
             )
             return True
         except Exception:
@@ -68,11 +75,15 @@ class BrokerClient:
         import pika
 
         channel = connection.channel()
-        channel.queue_declare(queue=queue, durable=True)
+        channel.queue_declare(queue=queue, durable=True, arguments={"x-max-priority": 10})
         channel.basic_qos(prefetch_count=1)
 
-        def on_message(_ch, method, _properties, body):
+        def on_message(_ch, method, properties, body):
             payload = json.loads(body.decode("utf-8"))
+            if properties.headers and "headers" not in payload:
+                payload["headers"] = {str(k): str(v) for k, v in properties.headers.items()}
+            if properties.priority is not None and "priority" not in payload:
+                payload["priority"] = properties.priority
             handler(QueueMessage(**payload))
             _ch.basic_ack(delivery_tag=method.delivery_tag)
 

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -66,6 +66,7 @@ def create_job(
     max_attempts: int | None = None,
     idempotency_key: str | None = None,
     correlation_id: str | None = None,
+    priority: int = 5,
 ) -> Job:
     if idempotency_key:
         existing = db.scalar(
@@ -75,7 +76,9 @@ def create_job(
             return existing
 
     normalized_run_at = normalize_datetime(run_at)
+    job_id = str(uuid.uuid4())
     job = Job(
+        id=job_id,
         owner_id=owner.id,
         job_type=job_type,
         payload_json=serialize_payload(payload),
@@ -85,8 +88,24 @@ def create_job(
         status="scheduled" if normalized_run_at and normalized_run_at > now_utc_naive() else "queued",
         idempotency_key=idempotency_key,
         correlation_id=correlation_id or str(uuid.uuid4()),
+        priority=priority,
     )
     db.add(job)
+
+    # Transactional Outbox pattern: atomically write outbox event in the same transaction
+    if job.status == "queued":
+        from app.outbox import create_outbox_event
+        create_outbox_event(
+            db,
+            event_type="job.created",
+            payload={
+                "job_id": job.id,
+                "queue_name": job.queue_name,
+                "priority": job.priority,
+                "correlation_id": job.correlation_id,
+            },
+        )
+
     db.commit()
     db.refresh(job)
     jobs_created_total.inc()
@@ -128,6 +147,7 @@ def mark_job_running(db: Session, job: Job, worker_id: str | None = None) -> Job
     job.worker_id = worker_id
     job.started_at = job.started_at or now_utc_naive()
     job.attempts += 1
+    job.execution_token = str(uuid.uuid4())
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -193,38 +213,47 @@ def claim_next_job(db: Session, worker_id: str | None = None) -> Job | None:
         select(Job)
         .where(Job.status.in_(["queued", "retrying"]))
         .where((Job.run_at.is_(None)) | (Job.run_at <= now))
-        .order_by(Job.created_at.asc())
+        .order_by(Job.priority.desc(), Job.created_at.asc())
     )
-    if db.bind and db.bind.dialect.name == "postgresql":
-        query = query.with_for_update(skip_locked=True)
-        job = db.scalars(query.limit(1)).first()
-        if not job:
-            return None
-        return mark_job_running(db, job, worker_id=worker_id)
+
+    dialect_name = db.get_bind().dialect.name if db.get_bind() else "sqlite"
+    if dialect_name == "postgresql":
+        candidates = db.scalars(query.with_for_update(skip_locked=True).limit(20)).all()
+        for candidate in candidates:
+            active_count = db.scalar(
+                select(func.count(Job.id)).where(Job.owner_id == candidate.owner_id, Job.status == "running")
+            ) or 0
+            if active_count < settings.max_concurrent_jobs_per_tenant:
+                return mark_job_running(db, candidate, worker_id=worker_id)
+        return None
     else:
-        while True:
-            job = db.scalars(query.limit(1)).first()
-            if not job:
-                return None
-            
-            from sqlalchemy import update
+        candidates = db.scalars(query.limit(20)).all()
+        for candidate in candidates:
+            active_count = db.scalar(
+                select(func.count(Job.id)).where(Job.owner_id == candidate.owner_id, Job.status == "running")
+            ) or 0
+            if active_count >= settings.max_concurrent_jobs_per_tenant:
+                continue
+
+            exec_token = str(uuid.uuid4())
             stmt = (
                 update(Job)
-                .where(Job.id == job.id)
-                .where(Job.status == job.status)
+                .where(Job.id == candidate.id)
+                .where(Job.status == candidate.status)
                 .values(
                     status="running",
                     worker_id=worker_id,
-                    started_at=job.started_at or now_utc_naive(),
-                    attempts=Job.attempts + 1
+                    started_at=candidate.started_at or now_utc_naive(),
+                    attempts=Job.attempts + 1,
+                    execution_token=exec_token,
                 )
             )
             result = db.execute(stmt)
             if result.rowcount > 0:
                 db.commit()
-                db.refresh(job)
-                return job
-            # If rowcount == 0, another worker already claimed it, loop again
+                db.refresh(candidate)
+                return candidate
+        return None
 
 
 def due_scheduled_jobs(db: Session) -> list[Job]:

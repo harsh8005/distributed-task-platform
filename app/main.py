@@ -15,6 +15,10 @@ settings = get_settings()
 
 app = FastAPI(title=settings.app_name, version="1.0.0")
 
+from app.tracing import instrument_fastapi_app, setup_telemetry
+setup_telemetry(service_name="dtp-api")
+instrument_fastapi_app(app)
+
 if settings.allow_all_origins:
     app.add_middleware(
         CORSMiddleware,

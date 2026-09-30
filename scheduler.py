@@ -24,24 +24,33 @@ def schedule_once() -> int:
         if recovered:
             logger.info("Recovered %s orphaned jobs", recovered)
         
+        from app.outbox import create_outbox_event, relay_outbox_events
+        relayed = relay_outbox_events(session)
+        if relayed:
+            logger.info("Relayed %s pending outbox events", relayed)
+
         jobs = due_scheduled_jobs(session)
         if not jobs:
             return 0
-        job_ids = [job.id for job in jobs]
-        stmt = (
-            update(Job)
-            .where(Job.id.in_(job_ids))
-            .where(Job.status.in_(['scheduled', 'retrying']))
-            .values(status='queued')
-            .returning(Job.id, Job.queue_name)
-        )
-        result = session.execute(stmt).all()
-        session.commit()
-        
+
         count = 0
-        for row in result:
-            broker.publish(QueueMessage(job_id=row[0]), queue_name=row[1])
+        for job in jobs:
+            job.status = "queued"
+            create_outbox_event(
+                session,
+                event_type="job.scheduled_release",
+                payload={
+                    "job_id": job.id,
+                    "queue_name": job.queue_name,
+                    "priority": job.priority,
+                    "correlation_id": job.correlation_id,
+                },
+            )
+            session.add(job)
             count += 1
+
+        session.commit()
+        relay_outbox_events(session)
         return count
     finally:
         session.close()

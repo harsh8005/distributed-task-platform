@@ -40,6 +40,7 @@ def to_job_read(job: Job) -> JobRead:
         worker_id=job.worker_id,
         idempotency_key=job.idempotency_key,
         correlation_id=job.correlation_id,
+        priority=job.priority,
     )
 
 
@@ -73,9 +74,11 @@ def create_new_job(
         max_attempts=payload.max_attempts,
         idempotency_key=payload.idempotency_key,
         correlation_id=payload.correlation_id,
+        priority=payload.priority,
     )
     if job.status == "queued":
-        broker.publish(QueueMessage(job_id=job.id, correlation_id=job.correlation_id), queue_name=job.queue_name)
+        from app.outbox import relay_outbox_events
+        relay_outbox_events(db)
     cache.delete("dashboard:stats")
     return to_job_read(job)
 

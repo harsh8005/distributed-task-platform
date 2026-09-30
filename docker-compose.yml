@@ -35,6 +35,8 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
       ENABLE_REDIS: "true"
       ENABLE_RABBITMQ: "true"
+      ENABLE_OTEL: "true"
+      OTLP_ENDPOINT: "http://jaeger:4318/v1/traces"
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-in-production}
       AUTO_CREATE_TABLES: "true"
     ports:
@@ -43,6 +45,7 @@ services:
       - postgres
       - redis
       - rabbitmq
+      - jaeger
 
   worker:
     build: .
@@ -53,12 +56,15 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
       ENABLE_REDIS: "true"
       ENABLE_RABBITMQ: "true"
+      ENABLE_OTEL: "true"
+      OTLP_ENDPOINT: "http://jaeger:4318/v1/traces"
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-in-production}
       AUTO_CREATE_TABLES: "true"
     depends_on:
       - api
       - postgres
       - rabbitmq
+      - jaeger
 
   scheduler:
     build: .
@@ -69,12 +75,24 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
       ENABLE_REDIS: "true"
       ENABLE_RABBITMQ: "true"
+      ENABLE_OTEL: "true"
+      OTLP_ENDPOINT: "http://jaeger:4318/v1/traces"
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-in-production}
       AUTO_CREATE_TABLES: "true"
     depends_on:
       - api
       - postgres
       - rabbitmq
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
 
   prometheus:
     image: prom/prometheus:v2.54.1
@@ -96,4 +114,5 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
+
 
